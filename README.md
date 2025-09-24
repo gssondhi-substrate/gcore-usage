@@ -1,22 +1,22 @@
-# Gcore Statistics Report API
+## Gcore Statistics Report API
 
-A FastAPI service that generates and fetches cleaned statistics reports from Gcore for specific users/clients.
+FastAPI service that generates and fetches cleaned statistics reports from Gcore for specific users/clients.
 
 ## Features
 
-- Accepts Gcore access tokens via body, Authorization header, or X-Gcore-Token header
-- Pulls feature IDs for selected product types (CDN/CLOUD/WAAP)
-- Generates ResellerStatistics reports for date ranges
-- Polls report status until ready
-- Downloads JSON payload and filters to requested Gcore user/client ID
-- Removes all null/empty fields before returning results
+- **Product coverage**: CDN, WAAP, CLOUD
+- **Token**: Provide Gcore API token in the request body
+- **Report generation**: Creates ResellerStatistics for a date range
+- **Status polling**: Waits until report is ready, then downloads
+- **Filtering**: Keeps rows for the requested client/user ID only
+- **Cleaning**: Removes zero-only numeric fields and null/empty values
 
 ## Quick Start
 
 ### Local Development
 
 ```bash
-# Install dependencies (if not already installed)
+# Install dependencies
 pip install fastapi uvicorn httpx pydantic
 
 # Run the server
@@ -27,98 +27,128 @@ uvicorn main:app --reload --port 8080
 
 ```bash
 # Build the image
-docker build -t gcore-report-api .
+docker build -t gcore-usage:latest .
 
-# Run the container
-docker run -p 8080:8080 gcore-report-api
+# Run the container (default ports)
+docker run --name gcore-usage -p 8080:8080 gcore-usage:latest
+
+# Optionally override Gcore API endpoints
+docker run --name gcore-usage -p 8080:8080 \
+  -e GCORE_API_BASE=https://api.gcore.com \
+  -e GCORE_FEATURES_PATH=/billing/v3/report_features \
+  -e GCORE_GENERATE_PATH=/billing/v1/org/files/report \
+  -e GCORE_STATUS_PATH=/billing/v1/org/files/{uuid} \
+  -e GCORE_DOWNLOAD_PATH=/billing/v1/org/files/{uuid}/download \
+  gcore-usage:latest
 ```
 
 ## API Endpoints
 
-### Generate & Fetch Report
+### Generate CDN report
 
-**POST** `/reports/gcore`
+POST `/reports/cdn`
 
-Generate a cleaned statistics report for a specific Gcore user.
-
-**Request Body:**
+Request body:
 ```json
 {
+  "gcore_token": "<GCORE_TOKEN>",
   "gcore_user_id": "123456",
-  "date_from": "2025-01-01",
-  "date_to": "2025-01-15",
-  "products": ["CDN", "CLOUD", "WAAP"],
-  "timeout_seconds": 300,
-  "poll_interval_seconds": 5
+  "start_date": "2025-01-01",
+  "end_date": "2025-01-15"
 }
 ```
 
-**Headers:**
-- `Authorization: Bearer <GCORE_TOKEN>` (optional if token provided in body)
-- `X-Gcore-Token: <GCORE_TOKEN>` (alternative header)
-- `Content-Type: application/json`
-
-**Response:**
+Response body (example):
 ```json
 {
   "uuid": "a2b3c4d5-...",
   "status": "ready",
   "count": 42,
-  "data": [/* filtered and cleaned data for the user */]
+  "data": [ { "Client ID": "123456", "Metric value": 12.34 } ]
 }
 ```
 
-### Check Report Status
+### Generate WAAP report
 
-**GET** `/reports/gcore/{uuid}?mode=status`
+POST `/reports/waap`
 
-Check the status of a report generation.
+Body is the same as for CDN.
 
-### Download Raw Report
+### Generate CLOUD report
 
-**GET** `/reports/gcore/{uuid}?mode=download`
+POST `/reports/cloud`
 
-Download the raw JSON report without cleaning.
+Body is the same as for CDN.
 
-### Health Check
+### Generate all reports (aggregate)
 
-**GET** `/`
+POST `/reports/all`
 
-Simple health check endpoint.
+Body is the same as for CDN. Returns an object with keys `cdn`, `waap`, and `cloud` containing per-product results when available.
+
+### Check report status / Download raw JSON
+
+POST `/reports/gcore/{uuid}?mode=status|download`
+
+Request body:
+```json
+{ "gcore_token": "<GCORE_TOKEN>" }
+```
+
+- **mode=status**: returns raw status from Gcore
+- **mode=download**: returns `{ uuid, data }` with raw report payload
+
+### Health
+
+- GET `/` — simple health check
+- GET `/health` — detailed health
 
 ## Example Usage
 
 ```bash
-# Generate a report
-curl -X POST http://localhost:8080/reports/gcore \
-  -H "Authorization: Bearer <GCORE_TOKEN>" \
+# Generate a CDN report
+curl -sS -X POST http://localhost:8080/reports/cdn \
   -H "Content-Type: application/json" \
   -d '{
+    "gcore_token": "<GCORE_TOKEN>",
     "gcore_user_id": "123456",
-    "date_from": "2025-01-01",
-    "date_to": "2025-01-15",
-    "products": ["CDN", "CLOUD", "WAAP"]
+    "start_date": "2025-01-01",
+    "end_date": "2025-01-15"
   }'
 
-# Check report status
-curl -H "Authorization: Bearer <GCORE_TOKEN>" \
-  "http://localhost:8080/reports/gcore/a2b3c4d5-...?mode=status"
+# Generate all reports
+curl -sS -X POST http://localhost:8080/reports/all \
+  -H "Content-Type: application/json" \
+  -d '{
+    "gcore_token": "<GCORE_TOKEN>",
+    "gcore_user_id": "123456",
+    "start_date": "2025-01-01",
+    "end_date": "2025-01-15"
+  }'
 
-# Download raw report
-curl -H "Authorization: Bearer <GCORE_TOKEN>" \
-  "http://localhost:8080/reports/gcore/a2b3c4d5-...?mode=download"
+# Check report status (replace <UUID>)
+curl -sS -X POST "http://localhost:8080/reports/gcore/<UUID>?mode=status" \
+  -H "Content-Type: application/json" \
+  -d '{ "gcore_token": "<GCORE_TOKEN>" }'
+
+# Download raw report (replace <UUID>)
+curl -sS -X POST "http://localhost:8080/reports/gcore/<UUID>?mode=download" \
+  -H "Content-Type: application/json" \
+  -d '{ "gcore_token": "<GCORE_TOKEN>" }'
 ```
 
 ## Configuration
 
-- **Products**: Supports CDN, CLOUD, and WAAP (case-insensitive)
-- **Timeout**: Default 300 seconds, configurable 30-1200 seconds
-- **Poll Interval**: Default 5 seconds, configurable 2-30 seconds
-- **Format**: Currently only supports JSON (for data cleaning)
+- **Environment variables** (defaults shown; can be overridden at runtime):
+  - `GCORE_API_BASE=https://api.gcore.com`
+  - `GCORE_FEATURES_PATH=/billing/v3/report_features`
+  - `GCORE_GENERATE_PATH=/billing/v1/org/files/report`
+  - `GCORE_STATUS_PATH=/billing/v1/org/files/{uuid}`
+  - `GCORE_DOWNLOAD_PATH=/billing/v1/org/files/{uuid}/download`
 
 ## Notes
 
-- The service automatically maps product names to Gcore's expected format
-- Client filtering tries multiple common field names (client_id, client, etc.)
-- All null/empty fields are recursively removed from the response
-- The service handles various Gcore API response formats defensively
+- Product names are handled as required by Gcore (e.g., `Cloud` for CLOUD)
+- Client filtering tries multiple common field names and nested shapes
+- Zero-only numeric fields are pruned; null/empty structures are removed
+- CSV payloads are supported in addition to JSON
