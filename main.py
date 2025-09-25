@@ -4,11 +4,16 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import time
 from typing import List, Optional, Dict, Any
 
 import httpx
 from fastapi import FastAPI, HTTPException, Header, Body
 from pydantic import BaseModel, Field, validator
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -20,11 +25,20 @@ FEATURES_PATH = os.getenv("GCORE_FEATURES_PATH", "/billing/v3/report_features")
 GENERATE_PATH = os.getenv("GCORE_GENERATE_PATH", "/billing/v1/org/files/report")
 STATUS_PATH = os.getenv("GCORE_STATUS_PATH", "/billing/v1/org/files/{uuid}")
 DOWNLOAD_PATH = os.getenv("GCORE_DOWNLOAD_PATH", "/billing/v1/org/files/{uuid}/download")
+AUTH_PATH = os.getenv("GCORE_AUTH_PATH", "/iam/auth/jwt/login")
+
+# Authentication credentials
+GCORE_USERNAME = os.getenv("GCORE_USERNAME")
+GCORE_PASSWORD = os.getenv("GCORE_PASSWORD")
 
 FEATURES_URL = f"{API_BASE}{FEATURES_PATH}"
 GENERATE_URL = f"{API_BASE}{GENERATE_PATH}"
 STATUS_URL_TPL = f"{API_BASE}{STATUS_PATH}"
 DOWNLOAD_URL_TPL = f"{API_BASE}{DOWNLOAD_PATH}"
+AUTH_URL = f"{API_BASE}{AUTH_PATH}"
+
+# Token cache
+_token_cache = {"token": None, "expires_at": 0}
 
 app = FastAPI(title="Gcore Statistics Report API", version="1.0.0")
 
@@ -32,17 +46,24 @@ app = FastAPI(title="Gcore Statistics Report API", version="1.0.0")
 # ---------- Pydantic models ----------
 
 class SimpleReportRequest(BaseModel):
-    gcore_token: str = Field(..., description="Gcore API token")
     gcore_user_id: str = Field(..., description="Target Gcore Client/User ID to filter (string or numeric).")
     start_date: str = Field(..., pattern=r"^\d{4}-\d{2}-\d{2}$", description="Start date in YYYY-MM-DD format")
     end_date: str = Field(..., pattern=r"^\d{4}-\d{2}-\d{2}$", description="End date in YYYY-MM-DD format")
+    format: str = Field(default="json", description="Output format: json, csv, or excel")
+    
+    @validator('format')
+    def validate_format(cls, v):
+        allowed_formats = ['json', 'csv', 'excel']
+        if v.lower() not in allowed_formats:
+            raise ValueError(f'Format must be one of: {", ".join(allowed_formats)}')
+        return v.lower()
 
 
 class ReportResponse(BaseModel):
     uuid: str
     status: str
     count: int
-    data: List[Dict[str, Any]]
+    data: Any  # Can be List[Dict[str, Any]] for JSON/CSV or Dict for Excel
 
 
 # Dynamic aggregate response for /reports/all
@@ -51,8 +72,79 @@ class ReportResponse(BaseModel):
 
 # ---------- Utilities ----------
 
+async def _get_gcore_token() -> str:
+    """Get a valid Gcore access token, using cache if available."""
+    current_time = time.time()
+    
+    # Check if we have a valid cached token
+    if (_token_cache["token"] and 
+        _token_cache["expires_at"] > current_time + 60):  # 60 second buffer
+        logger.info("Using cached Gcore token")
+        return _token_cache["token"]
+    
+    # Validate credentials are available
+    if not GCORE_USERNAME or not GCORE_PASSWORD:
+        raise HTTPException(500, "Gcore credentials not configured. Set GCORE_USERNAME and GCORE_PASSWORD environment variables.")
+    
+    logger.info("Generating new Gcore token")
+    
+    # Generate new token
+    auth_payload = {
+        "username": GCORE_USERNAME,
+        "password": GCORE_PASSWORD
+    }
+    
+    async with httpx.AsyncClient(timeout=httpx.Timeout(30.0)) as client:
+        try:
+            r = await client.post(
+                AUTH_URL,
+                json=auth_payload,
+                headers={"Content-Type": "application/json"}
+            )
+            r.raise_for_status()
+            
+            auth_response = r.json()
+            access_token = auth_response.get("access") or auth_response.get("access_token")
+            
+            if not access_token:
+                logger.error(f"No access token in auth response: {auth_response}")
+                raise HTTPException(502, "Failed to get access token from Gcore auth API")
+            
+            # Cache the token (assume 1 hour expiration if not specified)
+            expires_in = auth_response.get("expires_in", 3600)
+            _token_cache["token"] = access_token
+            _token_cache["expires_at"] = current_time + expires_in
+            
+            logger.info(f"Successfully generated and cached Gcore token (expires in {expires_in}s)")
+            return access_token
+            
+        except httpx.HTTPStatusError as e:
+            logger.error(f"Gcore auth failed with status {e.response.status_code}: {e.response.text}")
+            if e.response.status_code == 401:
+                raise HTTPException(401, "Invalid Gcore credentials")
+            raise HTTPException(502, f"Gcore auth failed: {e.response.status_code}")
+        except Exception as e:
+            logger.error(f"Unexpected error during Gcore auth: {str(e)}")
+            raise HTTPException(502, f"Failed to authenticate with Gcore: {str(e)}")
+
 def _bearer_header(token: str) -> Dict[str, str]:
     return {"Authorization": f"Bearer {token}"}
+
+def _parse_accept_header(accept_header: Optional[str]) -> str:
+    """Parse Accept header to determine format."""
+    if not accept_header:
+        return "json"  # default
+    
+    accept_header = accept_header.lower().strip()
+    
+    if "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" in accept_header:
+        return "excel"
+    elif "text/csv" in accept_header:
+        return "csv"
+    elif "application/json" in accept_header:
+        return "json"
+    else:
+        return "json"  # default fallback
 
 def _strip_nulls(obj: Any) -> Any:
     """Recursively remove None, null-like, and empty containers."""
@@ -433,11 +525,20 @@ async def _wait_until_ready(client: httpx.AsyncClient, token: str, uuid: str, ti
         await asyncio.sleep(poll_s)
 
 
-async def _download_json(client: httpx.AsyncClient, token: str, uuid: str) -> Any:
+async def _download_report(client: httpx.AsyncClient, token: str, uuid: str, format: str = "json") -> Any:
     url = DOWNLOAD_URL_TPL.format(uuid=uuid)
-    headers = _bearer_header(token) | {"Accept": "application/json, text/csv; q=0.9, */*; q=0.1"}
     
-    logger.info(f"Downloading report from: {url}")
+    # Map format to Accept header (exactly as per Gcore documentation)
+    format_headers = {
+        "json": "application/json",
+        "csv": "text/csv", 
+        "excel": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    }
+    
+    accept_header = format_headers.get(format, "application/json")
+    headers = _bearer_header(token) | {"Accept": accept_header}
+    
+    logger.info(f"Downloading report from: {url} (format: {format})")
     r = await client.get(url, headers=headers)
     logger.info(f"Download response status: {r.status_code}; content-type: {r.headers.get('content-type')} ")
     
@@ -447,45 +548,57 @@ async def _download_json(client: httpx.AsyncClient, token: str, uuid: str) -> An
     r.raise_for_status()
 
     content_type = (r.headers.get("content-type") or "").lower()
-    text_body = None
-
-    # Handle CSV payloads
-    if "text/csv" in content_type or content_type.endswith("/csv"):
+    
+    # Handle different formats
+    if format == "csv" or "text/csv" in content_type:
         import csv
-        text_body = r.text
-        logger.info("Parsing CSV payload returned by Gcore")
+        logger.info("Processing CSV payload")
         rows: List[Dict[str, Any]] = []
-        reader = csv.DictReader(text_body.splitlines())
+        reader = csv.DictReader(r.text.splitlines())
         for row in reader:
             rows.append(row)
         logger.info(f"Parsed CSV rows: {len(rows)}")
         return rows
-
-    # Try JSON first
-    try:
-        data = r.json()
-        logger.info(f"Successfully downloaded JSON data with {len(data) if isinstance(data, (list, dict)) else 'unknown'} items")
-        return data
-    except Exception as e:
-        logger.warning(f"Failed to parse as JSON, trying text parsing: {e}")
-        # Attempt text->json if mislabelled
-        import json
-        text_body = text_body or r.text
-        data = json.loads(text_body)
-        logger.info(f"Successfully parsed text as JSON with {len(data) if isinstance(data, (list, dict)) else 'unknown'} items")
-        return data
+    
+    elif format == "excel" or "spreadsheetml" in content_type:
+        logger.info("Received Excel file - returning base64 encoded binary data")
+        import base64
+        return {
+            "content_type": content_type,
+            "data": base64.b64encode(r.content).decode('utf-8'),  # Base64 encode for JSON serialization
+            "size_bytes": len(r.content),
+            "format": "excel"
+        }
+    
+    else:  # JSON format (default)
+        try:
+            data = r.json()
+            logger.info(f"Successfully downloaded JSON data with {len(data) if isinstance(data, (list, dict)) else 'unknown'} items")
+            return data
+        except Exception as e:
+            logger.warning(f"Failed to parse as JSON, trying text parsing: {e}")
+            # Attempt text->json if mislabelled
+            import json
+            data = json.loads(r.text)
+            logger.info(f"Successfully parsed text as JSON with {len(data) if isinstance(data, (list, dict)) else 'unknown'} items")
+            return data
 
 
 # ---------- API endpoints ----------
 
-async def _generate_report_for_product(product_name: str, body: SimpleReportRequest) -> ReportResponse:
+async def _generate_report_for_product(product_name: str, body: SimpleReportRequest, accept_header: Optional[str] = None) -> ReportResponse:
     """Common logic for generating reports for a specific product."""
     logger.info(f"Starting report generation for product: {product_name}")
     logger.info(f"Request details - User ID: {body.gcore_user_id}, Date range: {body.start_date} to {body.end_date}")
     
-    # Use Gcore token from request body
-    token = body.gcore_token
+    # Get Gcore token internally
+    token = await _get_gcore_token()
     logger.info(f"Using Gcore token: {token[:20]}...")
+    
+    # Determine format from Accept header or body parameter
+    format_from_header = _parse_accept_header(accept_header)
+    final_format = format_from_header if format_from_header != "json" or body.format == "json" else body.format
+    logger.info(f"Using format: {final_format} (from header: {format_from_header}, from body: {body.format})")
 
     async with httpx.AsyncClient(timeout=httpx.Timeout(300.0, read=300.0, write=60.0, connect=30.0)) as client:
         # 1) Get features for this specific product
@@ -500,37 +613,91 @@ async def _generate_report_for_product(product_name: str, body: SimpleReportRequ
         logger.info("Step 3: Waiting for report to be ready...")
         status = await _wait_until_ready(client, token, uuid, 600, 10)
         
-        # 4) Download JSON
-        logger.info("Step 4: Downloading report data...")
-        raw = await _download_json(client, token, uuid)
+        # 4) Download report in requested format
+        logger.info(f"Step 4: Downloading report data in {final_format} format...")
+        raw = await _download_report(client, token, uuid, final_format)
 
-    # Defensive: normalize the payload to a list of rows
-    logger.info("Step 5: Processing and filtering data...")
-    rows: List[Dict[str, Any]] = _normalize_rows(raw)
-    logger.info(f"Total rows before filtering: {len(rows)}")
+    # Handle different formats
+    if final_format == "excel":
+        # For Excel, return the base64 encoded binary data without processing
+        logger.info("Excel format requested - returning base64 encoded binary data")
+        result = ReportResponse(
+            uuid=uuid, 
+            status=status, 
+            count=raw.get("size_bytes", 0) if isinstance(raw, dict) else 0, 
+            data=raw
+        )
+        logger.info(f"Report generation completed successfully! UUID: {uuid}, Status: {status}, Format: Excel, Size: {raw.get('size_bytes', 0)} bytes")
+        return result
+    
+    elif final_format == "csv":
+        # For CSV, apply filtering but preserve original column structure
+        logger.info("CSV format requested - applying filtering while preserving column structure")
+        rows: List[Dict[str, Any]] = _normalize_rows(raw)
+        logger.info(f"Total rows before filtering: {len(rows)}")
 
-    # Filter to the target user/client id and non-zero Metric value (CSV-aware)
-    filtered = _filter_by_client_and_metric(rows, body.gcore_user_id)
-    logger.info(f"Rows after filtering for user {body.gcore_user_id} with non-zero 'Metric value': {len(filtered)}")
+        # Filter to the target user/client id and non-zero Metric value (CSV-aware)
+        filtered = _filter_by_client_and_metric(rows, body.gcore_user_id)
+        logger.info(f"Rows after filtering for user {body.gcore_user_id} with non-zero 'Metric value': {len(filtered)}")
+        
+        # Convert filtered data back to CSV format
+        if filtered:
+            import csv
+            import io
+            
+            # Get all unique keys from all rows to ensure consistent columns
+            all_keys = set()
+            for row in filtered:
+                all_keys.update(row.keys())
+            
+            # Sort keys to maintain consistent column order
+            fieldnames = sorted(all_keys)
+            
+            # Create CSV string
+            output = io.StringIO()
+            writer = csv.DictWriter(output, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(filtered)
+            csv_content = output.getvalue()
+            output.close()
+            
+            result = ReportResponse(uuid=uuid, status=status, count=len(filtered), data=csv_content)
+            logger.info(f"Report generation completed successfully! UUID: {uuid}, Status: {status}, Count: {len(filtered)}, Format: CSV")
+            return result
+        else:
+            # No data found
+            result = ReportResponse(uuid=uuid, status=status, count=0, data="")
+            logger.info(f"Report generation completed successfully! UUID: {uuid}, Status: {status}, Count: 0, Format: CSV")
+            return result
+    
+    else:  # JSON format - apply filtering and cleaning
+        logger.info("JSON format requested - processing and filtering data...")
+        rows: List[Dict[str, Any]] = _normalize_rows(raw)
+        logger.info(f"Total rows before filtering: {len(rows)}")
 
-    # Remove numeric-zero fields, then strip null/empty recursively
-    without_zeros = [_remove_zero_numeric_fields(r) for r in filtered]
-    cleaned = [_strip_nulls(r) for r in without_zeros]
-    logger.info(f"Final cleaned data count: {len(cleaned)}")
+        # Filter to the target user/client id and non-zero Metric value (CSV-aware)
+        filtered = _filter_by_client_and_metric(rows, body.gcore_user_id)
+        logger.info(f"Rows after filtering for user {body.gcore_user_id} with non-zero 'Metric value': {len(filtered)}")
 
-    result = ReportResponse(uuid=uuid, status=status, count=len(cleaned), data=cleaned)
-    logger.info(f"Report generation completed successfully! UUID: {uuid}, Status: {status}, Count: {len(cleaned)}")
-    return result
+        # Remove numeric-zero fields, then strip null/empty recursively
+        without_zeros = [_remove_zero_numeric_fields(r) for r in filtered]
+        cleaned = [_strip_nulls(r) for r in without_zeros]
+        logger.info(f"Final cleaned data count: {len(cleaned)}")
+
+        result = ReportResponse(uuid=uuid, status=status, count=len(cleaned), data=cleaned)
+        logger.info(f"Report generation completed successfully! UUID: {uuid}, Status: {status}, Count: {len(cleaned)}, Format: {final_format}")
+        return result
 
 
 @app.post("/reports/cdn", response_model=ReportResponse, summary="Generate CDN statistics report for a Gcore user")
 async def generate_cdn_report(
     body: SimpleReportRequest = Body(...),
+    accept: Optional[str] = Header(None, alias="Accept")
 ):
     """Generate a CDN statistics report for the specified Gcore user and date range."""
     logger.info("=== CDN Report Request Received ===")
     try:
-        result = await _generate_report_for_product("CDN", body)
+        result = await _generate_report_for_product("CDN", body, accept)
         logger.info("=== CDN Report Request Completed Successfully ===")
         return result
     except Exception as e:
@@ -541,42 +708,45 @@ async def generate_cdn_report(
 @app.post("/reports/waap", response_model=ReportResponse, summary="Generate WAAP statistics report for a Gcore user")
 async def generate_waap_report(
     body: SimpleReportRequest = Body(...),
+    accept: Optional[str] = Header(None, alias="Accept")
 ):
     """Generate a WAAP statistics report for the specified Gcore user and date range."""
-    return await _generate_report_for_product("WAAP", body)
+    return await _generate_report_for_product("WAAP", body, accept)
 
 
 @app.post("/reports/cloud", response_model=ReportResponse, summary="Generate CLOUD statistics report for a Gcore user")
 async def generate_cloud_report(
     body: SimpleReportRequest = Body(...),
+    accept: Optional[str] = Header(None, alias="Accept")
 ):
     """Generate a CLOUD statistics report for the specified Gcore user and date range."""
-    return await _generate_report_for_product("Cloud", body)
+    return await _generate_report_for_product("Cloud", body, accept)
 
 
 @app.post("/reports/all", response_model=dict, summary="Generate reports for CDN, WAAP and CLOUD for a Gcore user")
 async def generate_all_reports(
     body: SimpleReportRequest = Body(...),
+    accept: Optional[str] = Header(None, alias="Accept")
 ):
     """Generate and return reports for CDN, WAAP, and CLOUD in one call."""
     logger.info("=== ALL Reports Request Received ===")
     result: Dict[str, Any] = {"cdn": {}, "waap": {}, "cloud": {}}
     try:
-        cdn = await _generate_report_for_product("CDN", body)
+        cdn = await _generate_report_for_product("CDN", body, accept)
         if cdn.count > 0:
             result["cdn"] = cdn.dict()
     except HTTPException as e:
         logger.info(f"CDN skipped due to error: {e.detail}")
     
     try:
-        waap = await _generate_report_for_product("WAAP", body)
+        waap = await _generate_report_for_product("WAAP", body, accept)
         if waap.count > 0:
             result["waap"] = waap.dict()
     except HTTPException as e:
         logger.info(f"WAAP skipped due to error: {e.detail}")
     
     try:
-        cloud = await _generate_report_for_product("Cloud", body)
+        cloud = await _generate_report_for_product("Cloud", body, accept)
         if cloud.count > 0:
             result["cloud"] = cloud.dict()
     except HTTPException as e:
@@ -587,16 +757,28 @@ async def generate_all_reports(
 
 
 class StatusRequest(BaseModel):
-    gcore_token: str = Field(..., description="Gcore API token")
+    format: str = Field(default="json", description="Output format: json, csv, or excel")
+    
+    @validator('format')
+    def validate_format(cls, v):
+        allowed_formats = ['json', 'csv', 'excel']
+        if v.lower() not in allowed_formats:
+            raise ValueError(f'Format must be one of: {", ".join(allowed_formats)}')
+        return v.lower()
 
 @app.post("/reports/gcore/{uuid}", summary="Check report status or fetch raw JSON (no cleaning)", response_model=dict)
 async def get_report_or_json(
     uuid: str,
     body: StatusRequest = Body(...),
     mode: str = "status",  # "status" or "download"
+    accept: Optional[str] = Header(None, alias="Accept")
 ):
-    # Use Gcore token from request body
-    token = body.gcore_token
+    # Get Gcore token internally
+    token = await _get_gcore_token()
+    
+    # Determine format from Accept header or body parameter
+    format_from_header = _parse_accept_header(accept)
+    final_format = format_from_header if format_from_header != "json" or body.format == "json" else body.format
 
     async with httpx.AsyncClient(timeout=httpx.Timeout(300.0, read=300.0, write=60.0, connect=30.0)) as client:
         if mode == "status":
@@ -606,8 +788,8 @@ async def get_report_or_json(
             r.raise_for_status()
             return r.json()
         elif mode == "download":
-            data = await _download_json(client, token, uuid)
-            return {"uuid": uuid, "data": data}
+            data = await _download_report(client, token, uuid, final_format)
+            return {"uuid": uuid, "format": final_format, "data": data}
         else:
             raise HTTPException(400, "mode must be 'status' or 'download'.")
 

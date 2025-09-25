@@ -13,7 +13,10 @@ ENV GCORE_API_BASE=https://api.gcore.com \
     GCORE_FEATURES_PATH=/billing/v3/report_features \
     GCORE_GENERATE_PATH=/billing/v1/org/files/report \
     GCORE_STATUS_PATH=/billing/v1/org/files/{uuid} \
-    GCORE_DOWNLOAD_PATH=/billing/v1/org/files/{uuid}/download
+    GCORE_DOWNLOAD_PATH=/billing/v1/org/files/{uuid}/download \
+    GCORE_AUTH_PATH=/iam/auth/jwt/login \
+    GCORE_USERNAME= \
+    GCORE_PASSWORD=
 
 EXPOSE 8080
 
