@@ -1,23 +1,42 @@
 FROM python:3.11-slim
 
+# Set environment variables
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PYTHONPATH=/app
+
+# Create app user
+RUN groupadd -r appuser && useradd -r -g appuser appuser
+
+# Set work directory
 WORKDIR /app
 
-# Copy the application
-COPY main.py /app/main.py
+# Install system dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
 
-# Install dependencies
-RUN pip install --no-cache-dir fastapi uvicorn httpx pydantic
+# Copy requirements and install Python dependencies
+COPY requirements.txt .
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir -r requirements.txt
 
-# Environment variables for Gcore API endpoints (override at runtime if needed)
-ENV GCORE_API_BASE=https://api.gcore.com \
-    GCORE_FEATURES_PATH=/billing/v3/report_features \
-    GCORE_GENERATE_PATH=/billing/v1/org/files/report \
-    GCORE_STATUS_PATH=/billing/v1/org/files/{uuid} \
-    GCORE_DOWNLOAD_PATH=/billing/v1/org/files/{uuid}/download \
-    GCORE_AUTH_PATH=/iam/auth/jwt/login \
-    GCORE_USERNAME= \
-    GCORE_PASSWORD=
+# Copy application code
+COPY . .
 
+# Create logs directory
+RUN mkdir -p /app/logs && chown -R appuser:appuser /app
+
+# Change to non-root user
+USER appuser
+
+# Expose port
 EXPOSE 8080
 
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8080"]
+# Health check
+HEALTHCHECK --interval=30s --timeout=30s --start-period=5s --retries=3 \
+    CMD curl -f http://localhost:8080/health || exit 1
+
+# Run the application
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8080", "--workers", "1"]

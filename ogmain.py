@@ -9,6 +9,7 @@ from typing import List, Optional, Dict, Any
 
 import httpx
 from fastapi import FastAPI, HTTPException, Header, Body
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, validator
 from dotenv import load_dotenv
 
@@ -16,7 +17,11 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # Configure logging
-logging.basicConfig(level=logging.INFO)
+log_level = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(
+    level=getattr(logging, log_level),
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
 # Gcore API configuration via environment variables (with safe defaults)
@@ -31,6 +36,9 @@ AUTH_PATH = os.getenv("GCORE_AUTH_PATH", "/iam/auth/jwt/login")
 GCORE_USERNAME = os.getenv("GCORE_USERNAME")
 GCORE_PASSWORD = os.getenv("GCORE_PASSWORD")
 
+# Token cache configuration
+TOKEN_CACHE_DURATION = int(os.getenv("TOKEN_CACHE_DURATION", "1800"))  # 30 minutes default
+
 FEATURES_URL = f"{API_BASE}{FEATURES_PATH}"
 GENERATE_URL = f"{API_BASE}{GENERATE_PATH}"
 STATUS_URL_TPL = f"{API_BASE}{STATUS_PATH}"
@@ -40,7 +48,25 @@ AUTH_URL = f"{API_BASE}{AUTH_PATH}"
 # Token cache
 _token_cache = {"token": None, "expires_at": 0}
 
-app = FastAPI(title="Gcore Statistics Report API", version="1.0.0")
+app = FastAPI(
+    title="Gcore Statistics Report API", 
+    version="1.0.0",
+    description="API for generating and downloading Gcore usage reports in multiple formats"
+)
+
+# Health check endpoint
+@app.get("/health")
+async def health_check():
+    """Health check endpoint for load balancers and monitoring."""
+    return JSONResponse(
+        status_code=200,
+        content={
+            "status": "healthy",
+            "service": "gcore-usage-api",
+            "version": "1.0.0",
+            "timestamp": time.time()
+        }
+    )
 
 
 # ---------- Pydantic models ----------
@@ -111,7 +137,7 @@ async def _get_gcore_token() -> str:
                 raise HTTPException(502, "Failed to get access token from Gcore auth API")
             
             # Cache the token (assume 1 hour expiration if not specified)
-            expires_in = auth_response.get("expires_in", 3600)
+            expires_in = auth_response.get("expires_in", TOKEN_CACHE_DURATION)
             _token_cache["token"] = access_token
             _token_cache["expires_at"] = current_time + expires_in
             
